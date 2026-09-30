@@ -8,5 +8,8 @@
         # current session's logged model route (recommended).
         # provider: ''
         # model: ''
-        maxOutputTokens: 800
+        maxOutputTokens: 2000
         timeoutMs: 30000
+        # Reasoning tokens share maxOutputTokens; 'off' keeps the whole budget
+        # for the rewrite (a truncation still retries once with a doubled cap).
+        reasoningEffort: off
