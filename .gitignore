@@ -1,0 +1,9 @@
+# Dependencies (schemastery is vendored via npm install; reproducible from package.json)
+node_modules/
+
+# Logs and local state
+*.log
+
+# OS / editor noise
+Thumbs.db
+.DS_Store
