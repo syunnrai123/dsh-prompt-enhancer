@@ -7,7 +7,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Config, apply, __internals } from '../lib/index.js';
 
-const { createCache, withDeadline, digest, normalizeTimeout } = __internals;
+const { createCache, withDeadline, digest, normalizeTimeout, gatherSignals } = __internals;
 
 const sleep = (ms) => new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
 function* okGen() {
@@ -16,7 +16,7 @@ function* okGen() {
 }
 
 /** Register the real plugin on a fake ctx with a scripted llm; count stream calls. */
-function makeHarness({ routeOf, timeout = 5000, gen = okGen }) {
+function makeHarness({ routeOf, timeout = 5000, gen = okGen, surfaceDelay = 0 }) {
 	const calls = [];
 	let handler;
 	let currentRoute = { provider: 'p', model: 'm' };
@@ -37,7 +37,10 @@ function makeHarness({ routeOf, timeout = 5000, gen = okGen }) {
 		},
 		sessionQuery: {
 			filterEvents: async () => [],
-			readSurface: async () => ({ session: { cwd: undefined } }),
+			readSurface: async () => {
+				if (surfaceDelay > 0) await sleep(surfaceDelay);
+				return { session: { cwd: undefined } };
+			},
 		},
 	};
 	apply(ctx, Config({ timeout }));
@@ -114,6 +117,8 @@ test('timeout: defaults to 30000ms when unset', () => {
 
 test('timeout: a custom value is honored', () => {
 	assert.equal(normalizeTimeout(Config({ timeout: 1500 })), 1500);
+	assert.equal(normalizeTimeout(Config({ timeout: 2500.9 })), 2500); // floats floor
+	assert.equal(normalizeTimeout(Config({ timeout: '2500' })), 2500); // numeric strings accepted
 });
 
 test('timeout: invalid values fall back to 30000ms without throwing', () => {
@@ -191,6 +196,24 @@ test('flow: a generous custom timeout leaves the happy path intact', async () =>
 	const result = await h.run('正常增强这个草稿');
 	assert.equal(result.kind, 'success');
 	assert.ok(result.text.includes('## 目标'));
+});
+
+test('flow: the deadline covers the gathering phase, not just generation', async () => {
+	// readSurface stalls past the 60ms deadline; the model must never be called.
+	const h = makeHarness({ timeout: 60, surfaceDelay: 300 });
+	const result = await h.run('采集也要受预算约束');
+	assert.equal(result.kind, 'error');
+	assert.match(result.text, /增强超时（60ms）/);
+	assert.equal(h.calls.length, 0);
+});
+
+test('gather: an already-aborted signal rejects before any work', async () => {
+	const controller = new AbortController();
+	controller.abort(new Error('stop before gathering'));
+	await assert.rejects(
+		() => gatherSignals({}, Config({ provider: 'p', model: 'm' }), { session: { id: 'x' } }, '草稿', controller.signal),
+		/stop before gathering/,
+	);
 });
 
 test('flow: the corrective retry spends the same end-to-end budget', async () => {
