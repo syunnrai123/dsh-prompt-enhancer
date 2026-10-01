@@ -9,14 +9,14 @@ DeepSeek Harness (DSH) 提示词增强插件：先把工作区"查清楚"，再�
 - ✅ `/enhance <草稿>` 命令 + 输入框火花按钮（星星随草稿状态变色：空 `#0E6FEA` / 有词 `#E31D34`）
 - ✅ 结果面板（滑入动效、复制 / 替换草稿 / 关闭、pending / error / success 三态）
 - ✅ 模型路由默认跟随当前会话（`session.requestHeader()`），可配置覆盖
-- ✅ 30s 硬超时 + 结果缓存（草稿+路由+上下文摘要键）
+- ✅ 端到端硬超时默认 30s、可配 `timeout`（纠正性重试共用同一预算，不重启计时）+ 结果缓存（草稿+路由+上下文摘要键）
 - ✅ **工作区自检上下文包**（全部 DSH 内部能力，进程内；单次采集实测 ~100ms）：
 
 | 段 | 内容 | 作用（对应原本会问/会猜的问题） |
 |---|---|---|
 | 引用文件 | 草稿 `@` 提及的文件内容（≤2000 字/个，≤3 个） | "你说的那个文件" |
-| 工作区骨架 | 目录树（深度 2，跳过 node_modules/.git/dist 等 40+ 噪声目录），最深层目录**直接列出内部文件名**：`lib/ → client.js, index.js` | 项目结构 / 入口在哪 / 改哪个文件 |
-| 项目清单要点 | 真实读取 `package.json`/`pom.xml`/`pyproject.toml`/`Cargo.toml`/`go.mod` 等：包名、type、workspaces、engines、scripts、依赖清单；顶层没有清单时自动下探一层（多项目/子包） | 什么技术栈/语言/依赖/怎么跑 |
+| 工作区骨架 | 目录树（深度 2，跳过 node_modules/.git/dist/.dart_tool 等 50 个噪声目录），最深层目录**直接列出内部文件名**：`lib/ → client.js, index.js` | 项目结构 / 入口在哪 / 改哪个文件 |
+| 项目清单要点 | 真实读取 `package.json`/`pom.xml`/`pyproject.toml`/`Cargo.toml`/`go.mod`/`deno.json`/`pubspec.yaml`/`mix.exs`/`*.csproj` 等：包名、type、workspaces、engines、scripts、依赖清单；顶层没有清单时自动下探一层（多项目/子包） | 什么技术栈/语言/依赖/怎么跑 |
 | 项目类型 | 构建文件探测标签 + 顶层条目数 | 同上（兜底） |
 | 相关文件位置 | 用草稿里的标识符/中文词在工作区检索：先字面命中，再**文件名/路径**匹配，中文短语无字面命中时退化为**二元组集合**按命中数排序，输出 `文件:行 + 该行内容` | "这个功能在哪个文件里？" |
 | README 摘要 | 项目自己的 README 开头（自动剔除徽章/图片行），同样支持下探 | "这个项目是干什么的？" |
@@ -38,7 +38,7 @@ DeepSeek Harness (DSH) 提示词增强插件：先把工作区"查清楚"，再�
 - ✅ 反幻觉红线：系统提示词强制"只引用上下文包中确实存在的内容"，默认值不得与上下文矛盾
 - ✅ 信号采集全部容错（git 缺失 / 文件不可读 / sessionQuery 异常都静默降级，增强永不因此失败）
 - ✅ meta 行展示档位与信号摘要：`增强完成 · T2 项目感知 · 模型 x/y · 首 token · 总计 · tokens · 骨架 10 项 · 清单 · README · 测试线索`
-- ✅ 95 项单测（`node test/internals.test.mjs`）
+- ✅ 157 项断言、两个套件（`node --test`）：internals 纯函数 + runner 缓存 LRU / 超时配置与路径 / 缓存键组成
 
 ## 安装（本地开发）
 
@@ -59,7 +59,7 @@ Copy-Item -Recurse dsh-prompt-enhancer C:\Users\<user>\.dsh\profiles\desktop\nod
 |---|---|---|
 | `provider` + `model` | 未设置 | 必须成对设置；不设置则跟随当前会话的模型路由（推荐） |
 | `maxOutputTokens` | 2000 | 增强输出 token 上限（**推理 token 与正文共享此预算**，高推理档模型尤其注意） |
-| `timeoutMs` | 30000 | 单次增强端到端超时 |
+| `timeout` | 30000 | 单次增强端到端超时，毫秒（生成阶段；纠正性重试共用同一预算，不重启计时）。非法值（≤0 / 非数字）自动回退 30000，不报错；旧名 `timeoutMs` 仍兼容（`timeout` 优先） |
 | `reasoningEffort` | `off` | 辅助调用推理档位（合法值 off/low/high/max）；`off` 把全部预算留给正文，设为空字符串则不传该字段 |
 | `systemPromptExtra` | 空 | 追加到增强系统提示词的自定义指令 |
 | `contextEnabled` | true | 上下文采集总开关（false 时固定 T0 纯改写） |

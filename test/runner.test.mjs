@@ -1,0 +1,216 @@
+/**
+ * node:test suite for the runtime machinery: cache behaviour, the shared
+ * timeout deadline, and the cache-key composition (draft / route / pack).
+ * Run with `node --test test/`.
+ */
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { Config, apply, __internals } from '../lib/index.js';
+
+const { createCache, withDeadline, digest, normalizeTimeout } = __internals;
+
+const sleep = (ms) => new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
+function* okGen() {
+	yield { type: 'text-delta', text: '## 目标\n做一件事' };
+	yield { type: 'finish', reason: { kind: 'stop' } };
+}
+
+/** Register the real plugin on a fake ctx with a scripted llm; count stream calls. */
+function makeHarness({ routeOf, timeout = 5000, gen = okGen }) {
+	const calls = [];
+	let handler;
+	let currentRoute = { provider: 'p', model: 'm' };
+	const agent = {
+		session: {
+			id: 's1',
+			requestHeader: () => ({ config: routeOf ? routeOf() : currentRoute }),
+		},
+	};
+	const ctx = {
+		get: () => undefined,
+		commands: { register: (definition) => { handler = definition.handler; } },
+		llm: {
+			async *stream(options) {
+				calls.push(options);
+				yield* gen();
+			},
+		},
+		sessionQuery: {
+			filterEvents: async () => [],
+			readSurface: async () => ({ session: { cwd: undefined } }),
+		},
+	};
+	apply(ctx, Config({ timeout }));
+	return {
+		calls,
+		setRoute: (route) => { currentRoute = route; },
+		run: (draft) => handler({ agent, rawInput: draft }),
+	};
+}
+
+// ── createCache (LRU) ──────────────────────────────────────────
+
+test('cache: evicts the least recently used entry', () => {
+	const cache = createCache(2);
+	cache.set('a', 1);
+	cache.set('b', 2);
+	assert.equal(cache.get('a'), 1); // refresh a past b
+	cache.set('c', 3);
+	assert.equal(cache.get('b'), undefined);
+	assert.equal(cache.get('a'), 1);
+	assert.equal(cache.get('c'), 3);
+});
+
+test('cache: overwriting a key does not grow the map', () => {
+	const cache = createCache(1);
+	cache.set('a', 1);
+	cache.set('a', 2);
+	assert.equal(cache.get('a'), 2);
+	cache.set('b', 3);
+	assert.equal(cache.get('a'), undefined);
+	assert.equal(cache.get('b'), 3);
+});
+
+// ── withDeadline (timeout semantics) ───────────────────────────
+
+test('deadline: fires with the TIMEOUT code and message', async () => {
+	const deadline = withDeadline(undefined, 20);
+	await sleep(60);
+	assert.equal(deadline.signal.aborted, true);
+	assert.equal(deadline.signal.reason.code, 'PROMPT_ENHANCE_TIMEOUT');
+	assert.match(deadline.signal.reason.message, /增强超时（20ms）/);
+});
+
+test('deadline: dispose cancels the timer', async () => {
+	const deadline = withDeadline(undefined, 20);
+	deadline.dispose();
+	await sleep(60);
+	assert.equal(deadline.signal.aborted, false);
+});
+
+test('deadline: forwards an outer abort reason', async () => {
+	const outer = new AbortController();
+	const deadline = withDeadline(outer.signal, 10_000);
+	const reason = new Error('user cancelled');
+	outer.abort(reason);
+	assert.equal(deadline.signal.aborted, true);
+	assert.equal(deadline.signal.reason, reason);
+	deadline.dispose();
+});
+
+// ── digest (cache-key component) ───────────────────────────────
+
+test('digest: stable, distinguishing, length-tagged', () => {
+	assert.equal(digest('abc'), digest('abc'));
+	assert.notEqual(digest('abc'), digest('abd'));
+	assert.ok(digest('abc').endsWith('-3'));
+});
+
+// ── timeout configuration (normalizeTimeout) ───────────────────
+
+test('timeout: defaults to 30000ms when unset', () => {
+	assert.equal(normalizeTimeout(Config({})), 30_000);
+});
+
+test('timeout: a custom value is honored', () => {
+	assert.equal(normalizeTimeout(Config({ timeout: 1500 })), 1500);
+});
+
+test('timeout: invalid values fall back to 30000ms without throwing', () => {
+	assert.equal(normalizeTimeout(Config({ timeout: -5 })), 30_000);
+	assert.equal(normalizeTimeout(Config({ timeout: 0 })), 30_000);
+	assert.equal(normalizeTimeout(Config({ timeout: 'abc' })), 30_000);
+	assert.equal(normalizeTimeout(Config({ timeout: null })), 30_000);
+});
+
+test('timeout: legacy timeoutMs alias still honored', () => {
+	assert.equal(normalizeTimeout(Config({ timeoutMs: 250 })), 250);
+	assert.equal(normalizeTimeout(Config({ timeout: 100, timeoutMs: 250 })), 100);
+});
+
+// ── end-to-end cache behaviour through the real apply() ────────
+
+test('flow: an identical draft hits the cache without a second call', async () => {
+	const h = makeHarness({});
+	const first = await h.run('分析下当前项目');
+	const second = await h.run('分析下当前项目');
+	assert.equal(h.calls.length, 1);
+	assert.equal(first.kind, 'success');
+	assert.ok(first.text.includes('## 目标'));
+	assert.ok(second.text.includes('缓存命中'));
+});
+
+test('flow: a different draft misses the cache', async () => {
+	const h = makeHarness({});
+	await h.run('分析下当前项目');
+	await h.run('优化下当前项目');
+	assert.equal(h.calls.length, 2);
+});
+
+test('flow: a route change misses the cache', async () => {
+	const h = makeHarness({});
+	await h.run('分析下当前项目');
+	h.setRoute({ provider: 'p', model: 'other-model' });
+	await h.run('分析下当前项目');
+	assert.equal(h.calls.length, 2);
+	assert.equal(h.calls[1].model, 'other-model');
+});
+
+test('flow: timeout aborts with a clear error and is never cached', async () => {
+	const h = makeHarness({
+		timeout: 60,
+		gen: async function* slowGen() {
+			await sleep(300);
+			yield { type: 'finish', reason: { kind: 'stop' } };
+		},
+	});
+	const first = await h.run('慢慢增强这个草稿');
+	assert.equal(first.kind, 'error');
+	assert.match(first.text, /增强超时（60ms）/);
+	const second = await h.run('慢慢增强这个草稿');
+	assert.equal(h.calls.length, 2); // errors must not poison the cache
+	assert.match(second.text, /增强超时/);
+});
+
+test('flow: a configured custom timeout drives the deadline end to end', async () => {
+	const h = makeHarness({
+		timeout: 50,
+		gen: async function* slowGen() {
+			await sleep(250);
+			yield { type: 'text-delta', text: 'too late' };
+			yield { type: 'finish', reason: { kind: 'stop' } };
+		},
+	});
+	const result = await h.run('自定义超时值测试');
+	assert.equal(result.kind, 'error');
+	assert.match(result.text, /增强超时（50ms）/); // the message carries the configured value
+});
+
+test('flow: a generous custom timeout leaves the happy path intact', async () => {
+	const h = makeHarness({ timeout: 10_000 });
+	const result = await h.run('正常增强这个草稿');
+	assert.equal(result.kind, 'success');
+	assert.ok(result.text.includes('## 目标'));
+});
+
+test('flow: the corrective retry spends the same end-to-end budget', async () => {
+	// First attempt fails fast with an unsupported effort field; the retry would
+	// succeed, but the 80ms shared deadline is already spent by the slow reply.
+	let attemptNo = 0;
+	const h = makeHarness({
+		timeout: 80,
+		gen: async function* scripted() {
+			attemptNo += 1;
+			if (attemptNo === 1) {
+				yield { type: 'finish', reason: { kind: 'error', failure: { message: 'provider "x" model "y" does not support reasoning effort "off"' } } };
+				return;
+			}
+			await sleep(400); // retry arrives after the shared deadline fired
+			yield { type: 'text-delta', text: 'late' };
+			yield { type: 'finish', reason: { kind: 'stop' } };
+		},
+	});
+	const result = await h.run('重试预算测试');
+	assert.equal(result.kind, 'error');
+	assert.match(result.text, /增强超时（80ms）/);
+});

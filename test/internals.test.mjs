@@ -7,7 +7,7 @@ import { join } from 'node:path';
 const {
   extractAtRefs, extractPathMentions, pathsFromToolDoc, routeTier, buildPack, digest, gatherRefFiles, signalSummary, nextAttempt, finishError,
   extractEntityTerms, manifestFacts, renderSkeleton, rankEntityHits, summarizeTests, walkWorkspace, gatherEntityHits, gatherSignals,
-  cjkBigrams, rankCounted, manifestCandidates, readmeCandidates, emptySignals: emptySignalsOf, runCommand, createCache,
+  cjkBigrams, rankCounted, manifestCandidates, readmeCandidates, emptySignals: emptySignalsOf,
 } = __internals;
 let failures = 0;
 function eq(name, actual, expected) {
@@ -200,6 +200,10 @@ eq('skeleton: nested file names inline', renderSkeleton(skeleton, new Map([['src
 eq('tests: vitest marker', summarizeTests(['vitest.config.ts'], ['src/a.test.ts'], '- scripts: test, build'), '框架线索 vitest.config.ts · 配置 vitest.config.ts · 测试文件 1 个 · 脚本 test');
 eq('tests: python layout', summarizeTests([], ['tests/test_api.py'], ''), '框架线索 pytest / go test · 目录 tests/ · 测试文件 1 个');
 eq('tests: nothing to say', summarizeTests([], ['src/app.ts'], ''), '');
+eq('tests: conftest counts as a pytest marker', summarizeTests(['conftest.py'], ['tests/test_x.py'], '').includes('conftest.py'), true);
+
+eq('manifest: csproj head lines kept', manifestFacts('Foo.csproj', '<Project Sdk="Microsoft.NET.Sdk">\n  <TargetFramework>net8.0</TargetFramework>\n</Project>').includes('TargetFramework'), true);
+eq('manifest: pubspec falls to generic lines', manifestFacts('pubspec.yaml', 'name: demo_app\ndependencies:\n  flutter:').includes('name: demo_app'), true);
 
 const ranked = rankEntityHits([
   { file: 'src/deep/nested/a.ts', line: 1, text: 'x' },
@@ -208,13 +212,19 @@ const ranked = rankEntityHits([
 ]);
 eq('rank: shallow source first', ranked.map((hit) => hit.file), ['README.md', 'src/lib/b.test.ts', 'src/deep/nested/a.ts']);
 
+eq('candidates: csproj pattern matched', manifestCandidates(['Foo.csproj', 'x.ts'], []).includes('Foo.csproj'), true);
+eq('candidates: plain files excluded', manifestCandidates(['a.ts', 'b.md'], []), []);
+
 // ── walkWorkspace + gatherEntityHits against a real workspace ──
 const tree = await mkdtemp(join(tmpdir(), 'dpenh-ws-'));
 try {
   await mkdir(join(tree, 'src', 'lib'), { recursive: true });
   await mkdir(join(tree, 'test'), { recursive: true });
   await mkdir(join(tree, 'node_modules', 'junk'), { recursive: true });
+  await mkdir(join(tree, '.dart_tool'), { recursive: true });
   await writeFile(join(tree, 'package.json'), JSON.stringify({ name: 'demo', scripts: { test: 'node --test' } }), 'utf8');
+  await writeFile(join(tree, 'Foo.csproj'), '<Project Sdk="Microsoft.NET.Sdk">\n  <TargetFramework>net8.0</TargetFramework>\n</Project>\n', 'utf8');
+  await writeFile(join(tree, '.dart_tool', 'generated.js'), 'junk', 'utf8');
   await writeFile(join(tree, 'src', 'lib', 'spark.ts'), 'export const SparkGlow = "#0E6FEA";\nconst 火花 = 1;\n', 'utf8');
   await writeFile(join(tree, 'src', 'lib', 'panel.ts'), '// 火花按钮配色：随草稿状态变化\nexport const panel = 1;\n', 'utf8');
   await writeFile(join(tree, 'test', 'spark.test.ts'), 'import { SparkGlow } from "../src/lib/spark";\n', 'utf8');
@@ -222,7 +232,9 @@ try {
 
   const walked = await walkWorkspace(tree, 2, 60, 4);
   eq('walk: skips node_modules', walked.files.some((file) => file.includes('node_modules')), false);
+  eq('walk: skips .dart_tool', walked.files.some((file) => file.includes('.dart_tool')), false);
   eq('walk: reaches depth-3 files', walked.files.includes('src/lib/spark.ts'), true);
+  eq('walk: csproj indexed as a top-level file', walked.files.includes('Foo.csproj'), true);
   eq('walk: dir file names recorded', walked.dirFiles.get('src/lib').names, ['panel.ts', 'spark.ts']);
   eq('walk: skeleton carries dirs', walked.skeleton.filter((entry) => entry.dir).map((entry) => entry.rel), ['src', 'test', 'src/lib']);
 
@@ -254,6 +266,8 @@ try {
   const integrationPack = buildPack(gathered, integrationTier, 10_000);
   eq('gather: tier from signals', integrationTier, 'T2');
   eq('gather: manifest facts read', gathered.manifests.includes('- name: demo'), true);
+  eq('gather: csproj adds a .NET label', gathered.project.labels.includes('C# / .NET'), true);
+  eq('gather: csproj manifest surfaced', gathered.manifests.includes('Foo.csproj'), true);
   eq('gather: package scripts surfaced', gathered.manifests.includes('- scripts: test'), true);
   eq('gather: readme excerpt drops badges', gathered.readme.text.includes('A demo project.') && !gathered.readme.text.includes('badge'), true);
   eq('gather: test clues found', gathered.tests.includes('测试文件 1 个'), true);
