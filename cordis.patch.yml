@@ -13,3 +13,13 @@
         # Reasoning tokens share maxOutputTokens; 'off' keeps the whole budget
         # for the rewrite (a truncation still retries once with a doubled cap).
         reasoningEffort: off
+        # Context pack: the harness inspects the workspace itself (skeleton,
+        # manifests, README, test clues, git history, keyword-located files), so
+        # the model resolves facts and cites real paths instead of guessing.
+        # Raising these costs input tokens on every enhancement; the pack stops
+        # at maxContextChars regardless.
+        maxContextChars: 10000
+        inventoryDepth: 2
+        inventoryScanDepth: 4
+        entitySearchEnabled: true
+        gitLogCount: 5
