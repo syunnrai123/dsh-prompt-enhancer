@@ -142,7 +142,7 @@ const effortHarness = (script) => {
   let handler;
   const ctx = {
     get: () => undefined,
-    commands: { register: (definition) => { handler = definition.handler; } },
+    commands: { register: (definition) => { if (definition.name === 'enhance') handler = definition.handler; } },
     llm: {
       *stream(options) {
         calls.push(options);

@@ -9,6 +9,7 @@ DeepSeek Harness (DSH) 提示词增强插件：先把工作区"查清楚"，再�
 - ✅ `/enhance <草稿>` 命令 + 输入框火花按钮（星星随草稿状态变色：空 `#0E6FEA` / 有词 `#E31D34`）
 - ✅ 结果面板（滑入动效、复制 / 替换草稿 / 关闭、pending / error / success 三态）
 - ✅ 模型路由默认跟随当前会话（`session.requestHeader()`），可配置覆盖
+- ✅ **预采集防抖（全静默）**：输入停顿（默认 800ms，可配 `precollectDebounce`，≤0 禁用）后自动预采集上下文包（纯本地、不调模型）。传输走插件自建的 Typert SRC remote（`prompt-enhancer/prefetch`，经 api-gateway RPC）——**不注册斜杠命令，菜单与命令日志零痕迹**；`/enhance` 命中时跳过采集阶段（meta 标注 `预采集命中`）；草稿变化即取消旧任务并杀掉其 git/ripgrep 子进程；单飞（同时最多一个预采集在跑）；预采集同样受 `timeout` 端到端预算约束，结果 60s 内有效；RPC 通道异常时静默降级为"无预采集"，不影响 `/enhance`
 - ✅ 端到端硬超时默认 30s、可配 `timeout`（**覆盖采集→生成全程**，纠正性重试共用同一预算不重启计时；取消/超时会终止 git/ripgrep 子进程）+ 结果缓存（键=草稿+路由+档位+上下文摘要）
 - ✅ **工作区自检上下文包**（全部 DSH 内部能力，进程内；单次采集实测 ~100ms）：
 
@@ -40,7 +41,7 @@ DeepSeek Harness (DSH) 提示词增强插件：先把工作区"查清楚"，再�
 - ✅ 秘密文件排除：`.env*` / `*.pem` / `*.key` / `*.p12` / `*.pfx` / `id_rsa*` 不参与关键词检索与片段引用（rg glob + 进程内扫描 + 片段读取三重闸；`@` 显式引用属用户主动行为，不在排除之列）
 - ✅ 信号采集全部容错（git 缺失 / 文件不可读 / sessionQuery 异常都静默降级，增强永不因此失败）
 - ✅ meta 行展示档位与信号摘要：`增强完成 · T2 项目感知 · 模型 x/y · 首 token · 总计 · tokens · 骨架 10 项 · 清单 · README · 测试线索`
-- ✅ 180 项断言、两个套件（`npm test` = `node --test`）：internals 纯函数 + runner 缓存 LRU / 超时配置与路径 / 缓存键组成 / 采集阶段预算与取消
+- ✅ 206 项断言、两个套件（`npm test` = `node --test`）：internals 纯函数 + runner 缓存 LRU / 超时配置与路径 / 缓存键组成 / 采集阶段预算与取消 / 预采集防抖与静默传输
 
 ## 安装（本地开发）
 
@@ -63,6 +64,7 @@ Copy-Item -Recurse dsh-prompt-enhancer C:\Users\<user>\.dsh\profiles\desktop\nod
 | `maxOutputTokens` | 2000 | 增强输出 token 上限（**推理 token 与正文共享此预算**，高推理档模型尤其注意） |
 | `timeout` | 30000 | 单次增强端到端超时，毫秒（覆盖上下文采集+生成全程；纠正性重试共用同一预算，不重启计时）。非法值（≤0 / 非数字）自动回退 30000，不报错；旧名 `timeoutMs` 仍兼容（`timeout` 优先） |
 | `reasoningEffort` | `off` | 辅助调用推理档位（合法值 off/low/high/max）；`off` 把全部预算留给正文，设为空字符串则不传该字段 |
+| `precollectDebounce` | 800 | 输入停顿多少毫秒后自动预采集上下文（纯本地、不调模型，`/enhance` 命中时跳过采集阶段）；≤0 禁用；非法值回退 800 |
 | `systemPromptExtra` | 空 | 追加到增强系统提示词的自定义指令 |
 | `contextEnabled` | true | 上下文采集总开关（false 时固定 T0 纯改写） |
 | `maxContextChars` | 10000 | 上下文包总字符预算（按段优先级填充，超预算的段直接舍弃） |
@@ -83,7 +85,7 @@ Copy-Item -Recurse dsh-prompt-enhancer C:\Users\<user>\.dsh\profiles\desktop\nod
 | P2 | DSH 内部上下文采集 + 三档策略路由 | ✅ 完成 |
 | P2+ | 澄清提问（提问卡片多轮往返） | ⏸ 已实现后回退，整体保留在 `stash@{0}` |
 | P3-lite | 工作区自检（骨架/清单/README/测试线索/提交历史）+ 关键词反查（含中文二元组回退） | ✅ 完成（当前版本） |
-| P3.5 | 双档模型（快速/质量）、预采集防抖、性能基准用例 | 待做 |
+| P3.5 | 预采集防抖（已实现，见功能清单）；余下：双档模型（快速/质量）、性能基准用例 | 🟡 部分完成 |
 
 ## 设计要点
 

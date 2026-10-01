@@ -15,6 +15,10 @@
         # Reasoning tokens share maxOutputTokens; 'off' keeps the whole budget
         # for the rewrite (a truncation still retries once with a doubled cap).
         reasoningEffort: off
+        # After typing settles for this many milliseconds the client pre-collects
+        # the context pack locally (no model call) so /enhance skips gathering.
+        # <=0 disables; invalid values fall back to 800.
+        precollectDebounce: 800
         # Context pack: the harness inspects the workspace itself (skeleton,
         # manifests, README, test clues, git history, keyword-located files), so
         # the model resolves facts and cites real paths instead of guessing.
