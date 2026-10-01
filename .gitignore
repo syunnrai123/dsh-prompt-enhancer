@@ -1,10 +1,28 @@
-# Dependencies (schemastery is vendored via npm install; reproducible from package.json)
+# Dependencies (schemastery is pinned via package-lock; reproducible from package.json)
 node_modules/
 
 # Logs and local state
 *.log
+logs/
+
+# Credential material — never commit (mirrors the plugin's own SECRET_FILE_RE)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+
+# Test artifacts
+coverage/
 
 # OS / editor noise
 Thumbs.db
+Desktop.ini
 .DS_Store
 .idea/
+.vscode/
+*.swp
+*.tmp
