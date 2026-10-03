@@ -1,8 +1,8 @@
-# dsh-prompt-enhancer bundle layer: inserts the /enhance command plugin.
+# dsh-plugin-prompt-enhancer bundle layer: inserts the /enhance command plugin.
 # Override any field from the profile's own cordis.patch.yml by id.
 - insert:
     - id: prompt-enhancer
-      name: dsh-prompt-enhancer
+      name: dsh-plugin-prompt-enhancer
       config:
         # provider + model must be set together; leave both unset to follow the
         # current session's logged model route (recommended).

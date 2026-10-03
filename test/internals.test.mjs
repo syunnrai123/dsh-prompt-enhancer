@@ -1,4 +1,4 @@
-/** Pure-function unit tests for dsh-prompt-enhancer internals. */
+/** Pure-function unit tests for dsh-plugin-prompt-enhancer internals. */
 import { Config, __internals } from '../lib/index.js';
 import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -70,10 +70,10 @@ eq('meta: T0 text', signalSummary(undefined, 'T0'), '纯改写（上下文关闭
 // ── gatherRefFiles (real filesystem) ──────────────────────────
 const root = await mkdtemp(join(tmpdir(), 'dpenh-'));
 try {
-  await mkdir(join(root, 'dsh-prompt-enhancer', 'lib'), { recursive: true });
-  await writeFile(join(root, 'dsh-prompt-enhancer', 'lib', 'client.js'), 'export const x = 1;', 'utf8');
+  await mkdir(join(root, 'dsh-plugin-prompt-enhancer', 'lib'), { recursive: true });
+  await writeFile(join(root, 'dsh-plugin-prompt-enhancer', 'lib', 'client.js'), 'export const x = 1;', 'utf8');
   await writeFile(join(root, 'top.ts'), 'const y = 2;', 'utf8');
-  const nested = join(root, 'dsh-prompt-enhancer', 'lib', 'client.js');
+  const nested = join(root, 'dsh-plugin-prompt-enhancer', 'lib', 'client.js');
 
   const exact = await gatherRefFiles(root, ['top.ts'], []);
   eq('ref: exact relative resolves', exact.files.length, 1);
@@ -88,7 +88,7 @@ try {
   eq('ref: fallback reads content', fallback.files[0].content.includes('export const x'), true);
   eq('ref: fallback clears miss', fallback.misses, []);
 
-  const backslash = await gatherRefFiles(root, ['dsh-prompt-enhancer\\lib\\client.js'], [nested]);
+  const backslash = await gatherRefFiles(root, ['dsh-plugin-prompt-enhancer\\lib\\client.js'], [nested]);
   eq('ref: backslash ref resolves', backslash.files.length, 1);
 
   const unreadable = await gatherRefFiles(root, ['nope/missing.ts'], ['D:\\other\\nope\\missing.ts']);
@@ -272,9 +272,11 @@ try {
   eq('locate: content hit wins over the name hit', both.hits[0].text.includes('export const panel'), true);
 
   // Credential-shaped files are indexed but their contents never surface.
-  await writeFile(join(tree, '.env'), 'SparkGlow_SECRET=sk-live-abcdef\n', 'utf8');
-  await writeFile(join(tree, '.env.local'), 'SparkGlow_TOKEN=tok\n', 'utf8');
-  await writeFile(join(tree, 'server.pem'), '-----BEGIN PRIVATE KEY-----\nSparkGlow\n', 'utf8');
+  // Values are deliberately obvious placeholders: real-looking key material in
+  // a public repository trips secret scanners even when it is only test data.
+  await writeFile(join(tree, '.env'), 'SparkGlow_SECRET=placeholder-value\n', 'utf8');
+  await writeFile(join(tree, '.env.local'), 'SparkGlow_TOKEN=placeholder\n', 'utf8');
+  await writeFile(join(tree, 'server.pem'), 'FAKE-KEY-MATERIAL-FOR-TESTS\nSparkGlow\n', 'utf8');
   await writeFile(join(tree, 'prod.env'), 'SparkGlow_PROD=1\n', 'utf8');
   const rewalk = await walkWorkspace(tree, 2, 60, 4);
   eq('secrets: credential files indexed', rewalk.files.includes('.env') && rewalk.files.includes('server.pem'), true);
