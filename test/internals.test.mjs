@@ -8,6 +8,7 @@ const {
   extractAtRefs, extractPathMentions, pathsFromToolDoc, routeTier, buildPack, digest, gatherRefFiles, signalSummary, nextAttempt, finishError,
   extractEntityTerms, manifestFacts, renderSkeleton, rankEntityHits, summarizeTests, walkWorkspace, gatherEntityHits, gatherSignals,
   cjkBigrams, rankCounted, manifestCandidates, readmeCandidates, emptySignals: emptySignalsOf, anchoredPrompt, greenfieldPrompt,
+  compressFileContent, detectLanguage, extractOutline, compressHeadTail, shouldSkipContent,
 } = __internals;
 let failures = 0;
 function eq(name, actual, expected) {
@@ -96,7 +97,8 @@ try {
 
   await writeFile(join(root, 'big.ts'), 'x'.repeat(3000), 'utf8');
   const big = await gatherRefFiles(root, ['big.ts'], []);
-  eq('ref: content truncated at the per-file budget', big.files[0].content.length < 3000 && big.files[0].content.endsWith('... (truncated)'), true);
+  eq('ref: content truncated at the per-file budget', big.files[0].content.length < 3000 && big.files[0].content.includes('省略'), true);
+  eq('ref: compression meta present', big.files[0].meta !== undefined && big.files[0].meta.includes('已压缩'), true);
 } finally {
   await rm(root, { recursive: true, force: true });
 }
@@ -329,6 +331,52 @@ eq('pack: T2 carries the git log', t2Pack.includes('Git 最近提交（分支 ma
 eq('pack: T2 withholds session-local signals', t2Pack.includes('本会话最近操作的文件'), false);
 eq('pack: entities are labelled partial when bigram-only', buildPack({ ...fullSignals, entities: { hits: [{ file: 'src/b.ts', line: 1, text: 'x', partialTerms: ['火花按钮颜色'] }], searched: ['火花按钮颜色'] } }, 'T2', 10_000).includes('（部分命中 火花按钮颜色）'), true);
 eq('pack: meta names the new sections', signalSummary(fullSignals, 'T2').includes('骨架 2 项') && signalSummary(fullSignals, 'T2').includes('README'), true);
+
+// ── file compression ─────────────────────────────────────────────
+eq('compress: detect js', detectLanguage('src/app.js'), 'js');
+eq('compress: detect ts', detectLanguage('lib/util.ts'), 'ts');
+eq('compress: detect py', detectLanguage('main.py'), 'py');
+eq('compress: detect unknown', detectLanguage('data.csv'), undefined);
+
+const jsCode = 'import x from "y";\nexport function foo() {\n  return 1;\n}\nexport const bar = 2;\nconst internal = 3;';
+const jsOutline = extractOutline(jsCode, 'js');
+eq('outline: js extracts exports', jsOutline.length >= 2, true);
+eq('outline: js includes export function', jsOutline.some((decl) => decl.text.includes('export function foo')), true);
+
+const pyCode = 'def foo():\n    return 1\n\nclass Bar:\n    pass\n\ndef internal():\n    pass';
+const pyOutline = extractOutline(pyCode, 'py');
+eq('outline: py extracts def and class', pyOutline.length, 3);
+eq('outline: py includes def foo', pyOutline.some((decl) => decl.text.includes('def foo')), true);
+
+eq('skip: package-lock.json', shouldSkipContent('package-lock.json'), true);
+eq('skip: yarn.lock', shouldSkipContent('yarn.lock'), true);
+eq('skip: min.js', shouldSkipContent('app.min.js'), true);
+eq('skip: png', shouldSkipContent('icon.png'), true);
+eq('skip: normal file', shouldSkipContent('src/app.js'), false);
+
+const smallContent = 'const x = 1;\nconst y = 2;';
+const smallResult = compressFileContent('test.js', smallContent, 2000);
+eq('compress: small file unchanged', smallResult.compressed, smallContent);
+eq('compress: small file no meta', smallResult.meta, undefined);
+
+const lockContent = JSON.stringify({ name: 'test', lockfileVersion: 3 });
+const lockResult = compressFileContent('package-lock.json', lockContent, 2000);
+eq('compress: lock file skipped', lockResult.compressed, '');
+eq('compress: lock file meta', lockResult.meta.includes('已跳过内容'), true);
+
+const largeJs = `${'import dep from "dep";\n'.repeat(10)}${'export function func() { return 1; }\n'.repeat(50)}${'const internal = 1;\n'.repeat(100)}`;
+const largeResult = compressFileContent('large.js', largeJs, 2000);
+eq('compress: large file has outline', largeResult.compressed.includes('大纲'), true);
+eq('compress: large file has meta', largeResult.meta !== undefined && largeResult.meta.includes('已压缩'), true);
+
+const headTailTest = 'a\n'.repeat(100) + 'b\n'.repeat(100);
+const headTailResult = compressHeadTail(headTailTest, 300);
+eq('compress: head-tail has ellipsis', headTailResult.compressed.includes('省略'), true);
+eq('compress: head-tail omitted > 0', headTailResult.omitted > 0, true);
+
+const hugeJs = 'export function f() {}\n'.repeat(6000);
+const hugeResult = compressFileContent('huge.js', hugeJs, 2000);
+eq('compress: huge file outline only', hugeResult.meta.includes('大纲 + 首尾摘要'), true);
 
 console.log(failures === 0 ? '\nALL PASS' : `\n${failures} FAILURES`);
 process.exit(failures === 0 ? 0 : 1);
