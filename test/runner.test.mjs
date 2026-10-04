@@ -7,7 +7,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Config, apply, __internals } from '../lib/index.js';
 
-const { createCache, withDeadline, digest, normalizeTimeout, gatherSignals, normalizeDebounce } = __internals;
+const { createCache, withDeadline, digest, normalizeTimeout, gatherSignals } = __internals;
 
 const sleep = (ms) => new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
 function* okGen() {
@@ -16,9 +16,7 @@ function* okGen() {
 }
 
 /** Register the real plugin on a fake ctx with a scripted llm; count stream calls
- *  and gather invocations (readSurface) so prefetch short-circuiting is visible.
- *  The silent prefetch transport is captured through ctx.provide, mirroring how
- *  the api-gateway discovers the host's 'prompt-enhancer' SRC remote. */
+ *  and gather invocations (readSurface) so context-gathering is observable. */
 function makeHarness({ routeOf, timeout = 5000, gen = okGen, surfaceDelay = 0 }) {
 	const calls = [];
 	const handlers = {};
@@ -57,7 +55,6 @@ function makeHarness({ routeOf, timeout = 5000, gen = okGen, surfaceDelay = 0 })
 		surfaceCalls: () => surfaceCalls,
 		setRoute: (route) => { currentRoute = route; },
 		run: (draft) => handlers.enhance({ agent, rawInput: draft }),
-		prefetch: (draft) => services.promptEnhancer.prefetch('s1', draft),
 	};
 }
 
@@ -150,77 +147,6 @@ test('deadline: abort() cancels early with the caller reason', async () => {
 	assert.equal(deadline.signal.aborted, true);
 	assert.equal(deadline.signal.reason, reason);
 	deadline.dispose();
-});
-
-// ── pre-collection debounce configuration ──────────────────────
-
-test('debounce: normalization', () => {
-	assert.equal(normalizeDebounce(Config({})), 800);
-	assert.equal(normalizeDebounce(Config({ precollectDebounce: 1500 })), 1500);
-	assert.equal(normalizeDebounce(Config({ precollectDebounce: 0 })), 0);
-	assert.equal(normalizeDebounce(Config({ precollectDebounce: -5 })), 0);
-	assert.equal(normalizeDebounce(Config({ precollectDebounce: 'abc' })), 800);
-});
-
-// ── pre-collection flow through the real apply() ───────────────
-
-test('prefetch: transported over the SRC remote, never as a slash command', () => {
-	const h = makeHarness({});
-	// No enhance-prefetch command is registered: the slash menu stays clean and
-	// the durable command log never gains a row for pre-collection.
-	assert.deepEqual(Object.keys(h.handlers), ['enhance']);
-	assert.equal(typeof h.prefetch, 'function'); // the RPC service took its place
-});
-
-test('prefetch: an empty draft skips silently', async () => {
-	const h = makeHarness({});
-	assert.deepEqual(await h.prefetch('   '), { skipped: true });
-	assert.equal(h.surfaceCalls(), 0);
-});
-
-test('prefetch: pre-collected context short-circuits the gather phase', async () => {
-	const h = makeHarness({});
-	const pre = await h.prefetch('分析下当前项目');
-	assert.deepEqual(pre, { stored: true }); // silent transport: a plain reply object, no visible text
-	const gathers = h.surfaceCalls();
-	const result = await h.run('分析下当前项目');
-	assert.equal(result.kind, 'success');
-	assert.equal(h.surfaceCalls(), gathers); // no second gather: no new git/ripgrep work
-	assert.ok(result.text.includes('预采集命中')); // the pre-collected pack was stored and consumed
-	assert.equal(h.calls.length, 1); // exactly one model call, same cache key inputs
-});
-
-test('prefetch: a different draft falls back to a fresh gather', async () => {
-	const h = makeHarness({});
-	await h.prefetch('草稿甲');
-	const gathers = h.surfaceCalls();
-	const result = await h.run('草稿乙');
-	assert.equal(result.kind, 'success');
-	assert.equal(h.surfaceCalls(), gathers + 1);
-	assert.equal(result.text.includes('预采集命中'), false);
-});
-
-test('prefetch: single-flight supersedes a slow earlier run', async () => {
-	const h = makeHarness({ surfaceDelay: 150 });
-	const first = h.prefetch('慢慢采集');
-	await sleep(30);
-	const second = await h.prefetch('新的草稿');
-	assert.deepEqual(await first, { stored: false }); // cancelled: nothing stored
-	assert.deepEqual(second, { stored: true }); // completed and stored
-	const gathers = h.surfaceCalls();
-	const result = await h.run('新的草稿');
-	assert.equal(result.kind, 'success');
-	assert.equal(h.surfaceCalls(), gathers); // the superseding run is the one consumed
-});
-
-test('prefetch: formal enhance aborts an in-flight pre-collection', async () => {
-	const h = makeHarness({ surfaceDelay: 150 });
-	const inFlight = h.prefetch('还在采集时用户就点了增强');
-	await sleep(30);
-	const result = await h.run('还在采集时用户就点了增强');
-	assert.equal(result.kind, 'success');
-	assert.equal(h.calls.length, 1); // its own gather ran (the prefetch had not stored)
-	assert.deepEqual(await inFlight, { stored: false }); // aborted silently
 });
 
 // ── end-to-end cache behaviour through the real apply() ────────
