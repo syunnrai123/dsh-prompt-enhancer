@@ -1,23 +1,30 @@
 /**
  * node:test suite for the runtime machinery: cache behaviour, the shared
- * timeout deadline, and the cache-key composition (draft / route / pack).
+ * timeout deadline, the cache-key composition (draft / route / pack), and the
+ * four-level route fallback (config pair / session / runtime manifests / built-in).
  * Run with `node --test test/`.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { Config, apply, __internals } from '../lib/index.js';
 
-const { createCache, withDeadline, digest, normalizeTimeout, gatherSignals } = __internals;
+const {
+	createCache, withDeadline, digest, normalizeTimeout, gatherSignals,
+	resolveRoute, routeFromRuntimeDoc, readRuntimeRoute, runtimeRouteBases, setRuntimeRoute, resetRuntimeRoute, DEFAULT_ROUTE,
+} = __internals;
 
 const sleep = (ms) => new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
 function* okGen() {
-	yield { type: 'text-delta', text: '## 目标\n做一件事' };
+	yield { type: 'text-delta', text: '先梳理当前项目的目录结构与依赖清单，再分析核心模块的调用关系，最后按优先级给出改进清单。' };
 	yield { type: 'finish', reason: { kind: 'stop' } };
 }
 
 /** Register the real plugin on a fake ctx with a scripted llm; count stream calls
  *  and gather invocations (readSurface) so context-gathering is observable. */
-function makeHarness({ routeOf, timeout = 5000, gen = okGen, surfaceDelay = 0 }) {
+function makeHarness({ routeOf, timeout = 5000, gen = okGen, surfaceDelay = 0, config = {} }) {
 	const calls = [];
 	const handlers = {};
 	const services = {};
@@ -48,7 +55,7 @@ function makeHarness({ routeOf, timeout = 5000, gen = okGen, surfaceDelay = 0 })
 			},
 		},
 	};
-	apply(ctx, Config({ timeout }));
+	apply(ctx, Config({ timeout, ...config }));
 	return {
 		calls,
 		handlers,
@@ -157,7 +164,7 @@ test('flow: an identical draft hits the cache without a second call', async () =
 	const second = await h.run('分析下当前项目');
 	assert.equal(h.calls.length, 1);
 	assert.equal(first.kind, 'success');
-	assert.ok(first.text.includes('## 目标'));
+	assert.ok(first.text.includes('目录结构'));
 	assert.ok(second.text.includes('缓存命中'));
 });
 
@@ -211,7 +218,7 @@ test('flow: a generous custom timeout leaves the happy path intact', async () =>
 	const h = makeHarness({ timeout: 10_000 });
 	const result = await h.run('正常增强这个草稿');
 	assert.equal(result.kind, 'success');
-	assert.ok(result.text.includes('## 目标'));
+	assert.ok(result.text.includes('目录结构'));
 });
 
 test('flow: the deadline covers the gathering phase, not just generation', async () => {
@@ -252,4 +259,279 @@ test('flow: the corrective retry spends the same end-to-end budget', async () =>
 	const result = await h.run('重试预算测试');
 	assert.equal(result.kind, 'error');
 	assert.match(result.text, /增强超时（80ms）/);
+});
+
+// ── resolveRoute: the four-level fallback ──────────────────────
+
+const sessionAgent = (route) => ({ session: { id: 's1', requestHeader: () => ({ config: route }) } });
+const throwingAgent = { session: { requestHeader: () => { throw new Error('no header in a blank session'); } } };
+
+test('route: the built-in default is the DSH default model', () => {
+	assert.deepEqual(DEFAULT_ROUTE, { provider: 'guomo', model: 'deepseek-v4.1-flash' });
+});
+
+test('route: an explicit config pair pins the route over the session', async () => {
+	const route = await resolveRoute(
+		Config({ provider: 'pin-p', model: 'pin-m' }),
+		sessionAgent({ provider: 's-p', model: 's-m' }),
+	);
+	assert.deepEqual(route, { provider: 'pin-p', model: 'pin-m', source: 'config' });
+});
+
+test('route: an empty-string pair counts as unset and falls through to the session', async () => {
+	const route = await resolveRoute(
+		Config({ provider: '', model: '' }),
+		sessionAgent({ provider: 's-p', model: 's-m' }),
+	);
+	assert.deepEqual(route, { provider: 's-p', model: 's-m', source: 'session' });
+});
+
+test('route: half a pair still throws the pairing error', async () => {
+	await assert.rejects(
+		() => resolveRoute(Config({ provider: 'pin-p' }), sessionAgent({ provider: 's-p', model: 's-m' })),
+		/prompt-enhancer: provider 与 model 必须成对配置/,
+	);
+});
+
+test('route: the session route is followed when no pair is configured', async () => {
+	const route = await resolveRoute(Config({}), sessionAgent({ provider: 's-p', model: 's-m' }));
+	assert.deepEqual(route, { provider: 's-p', model: 's-m', source: 'session' });
+});
+
+test('route: a blank session (no logged route) picks up the runtime level', async () => {
+	const route = await resolveRoute(
+		Config({}),
+		sessionAgent(undefined),
+		{ runtime: { provider: 'rt-p', model: 'rt-m' } },
+	);
+	assert.deepEqual(route, { provider: 'rt-p', model: 'rt-m', source: 'runtime' });
+});
+
+test('route: a session route outranks the runtime level', async () => {
+	const route = await resolveRoute(
+		Config({}),
+		sessionAgent({ provider: 's-p', model: 's-m' }),
+		{ runtime: { provider: 'rt-p', model: 'rt-m' } },
+	);
+	assert.deepEqual(route, { provider: 's-p', model: 's-m', source: 'session' });
+});
+
+test('route: a runtime entry missing its model half is skipped', async () => {
+	const route = await resolveRoute(
+		Config({}),
+		sessionAgent(undefined),
+		{ runtime: { provider: 'rt-p' } },
+	);
+	assert.deepEqual(route, { provider: 'guomo', model: 'deepseek-v4.1-flash', source: 'builtin' });
+});
+
+test('route: a blank session with no runtime entry lands on the built-in default', async () => {
+	const route = await resolveRoute(Config({}), sessionAgent(undefined), { runtime: undefined });
+	assert.deepEqual(route, { provider: 'guomo', model: 'deepseek-v4.1-flash', source: 'builtin' });
+});
+
+test('route: a throwing requestHeader counts as no session route', async () => {
+	const route = await resolveRoute(Config({}), throwingAgent, { runtime: undefined });
+	assert.deepEqual(route, { provider: 'guomo', model: 'deepseek-v4.1-flash', source: 'builtin' });
+});
+
+test('route: all four levels failing throws the original untouched-draft error', async () => {
+	await assert.rejects(
+		() => resolveRoute(Config({}), sessionAgent(undefined), { runtime: undefined, builtin: undefined }),
+		/prompt-enhancer: 当前会话还没有已记录的模型路由——请先发送一条消息，或在插件配置中显式指定 provider \+ model/,
+	);
+});
+
+// ── routeFromRuntimeDoc (level-3 field probes) ─────────────────
+
+test('runtime doc: top-level provider and model', () => {
+	assert.deepEqual(routeFromRuntimeDoc({ provider: 'p', model: 'm' }), { provider: 'p', model: 'm' });
+});
+
+test('runtime doc: dsh.agentDefaultModel nesting', () => {
+	assert.deepEqual(
+		routeFromRuntimeDoc({ name: 'x', dsh: { agentDefaultModel: { provider: 'p', model: 'm' } } }),
+		{ provider: 'p', model: 'm' },
+	);
+});
+
+test('runtime doc: bare defaultModel nesting', () => {
+	assert.deepEqual(routeFromRuntimeDoc({ defaultModel: { provider: 'p', model: 'm' } }), { provider: 'p', model: 'm' });
+});
+
+test('runtime doc: missing, half-filled, or non-string fields skip', () => {
+	assert.equal(routeFromRuntimeDoc({}), undefined);
+	assert.equal(routeFromRuntimeDoc({ provider: 'p' }), undefined);
+	assert.equal(routeFromRuntimeDoc({ provider: 3, model: 'm' }), undefined);
+	assert.equal(routeFromRuntimeDoc(null), undefined);
+	assert.equal(routeFromRuntimeDoc('nope'), undefined);
+	assert.equal(routeFromRuntimeDoc([]), undefined);
+});
+
+// ── readRuntimeRoute (real filesystem probes) ──────────────────
+
+test('runtime route: reads the default route out of the dsh package manifest', async () => {
+	const root = await mkdtemp(join(tmpdir(), 'dpenh-rt-'));
+	try {
+		await mkdir(join(root, '_dsh_src', 'dsh'), { recursive: true });
+		await writeFile(
+			join(root, '_dsh_src', 'dsh', 'package.json'),
+			JSON.stringify({ name: '@deepseek-ai/dsh-desktop-runtime', dsh: { agentDefaultModel: { provider: 'rt-p', model: 'rt-m' } } }),
+			'utf8',
+		);
+		const route = await readRuntimeRoute([root]);
+		assert.deepEqual(route, { provider: 'rt-p', model: 'rt-m' });
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+test('runtime route: desktop-runtime.json outranks package.json', async () => {
+	const root = await mkdtemp(join(tmpdir(), 'dpenh-rt2-'));
+	try {
+		await mkdir(join(root, '_dsh_src', 'dsh'), { recursive: true });
+		await writeFile(join(root, '_dsh_src', 'dsh', 'desktop-runtime.json'), JSON.stringify({ provider: 'dt-p', model: 'dt-m', files: [] }), 'utf8');
+		await writeFile(join(root, '_dsh_src', 'dsh', 'package.json'), JSON.stringify({ provider: 'pk-p', model: 'pk-m' }), 'utf8');
+		const route = await readRuntimeRoute([root]);
+		assert.deepEqual(route, { provider: 'dt-p', model: 'dt-m' });
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+test('runtime route: a malformed manifest falls through to the next one', async () => {
+	const root = await mkdtemp(join(tmpdir(), 'dpenh-rt3-'));
+	try {
+		await mkdir(join(root, '_dsh_src', 'dsh'), { recursive: true });
+		await writeFile(join(root, '_dsh_src', 'dsh', 'desktop-runtime.json'), '{broken json', 'utf8');
+		await writeFile(join(root, '_dsh_src', 'dsh', 'package.json'), JSON.stringify({ provider: 'pk-p', model: 'pk-m' }), 'utf8');
+		const route = await readRuntimeRoute([root]);
+		assert.deepEqual(route, { provider: 'pk-p', model: 'pk-m' });
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+test('runtime route: no dsh manifests or no route fields skip the level', async () => {
+	const empty = await mkdtemp(join(tmpdir(), 'dpenh-rt4-'));
+	const fieldless = await mkdtemp(join(tmpdir(), 'dpenh-rt5-'));
+	try {
+		assert.equal(await readRuntimeRoute([empty]), undefined);
+		await mkdir(join(fieldless, '_dsh_src', 'dsh'), { recursive: true });
+		await writeFile(join(fieldless, '_dsh_src', 'dsh', 'package.json'), JSON.stringify({ name: 'x', version: '1' }), 'utf8');
+		assert.equal(await readRuntimeRoute([fieldless]), undefined);
+	} finally {
+		await rm(empty, { recursive: true, force: true });
+		await rm(fieldless, { recursive: true, force: true });
+	}
+});
+
+test('runtime route: the base walk-up covers ancestors plus cwd', async () => {
+	const root = await mkdtemp(join(tmpdir(), 'dpenh-rt6-'));
+	try {
+		const nested = join(root, 'a', 'b');
+		const bases = runtimeRouteBases(nested);
+		assert.ok(bases.includes(nested));
+		assert.ok(bases.includes(join(root, 'a')));
+		assert.ok(bases.includes(root));
+		assert.ok(bases.includes(process.cwd()));
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+// ── end-to-end: blank-session flows through the real apply() ───
+
+test('flow: blank session without config enhances via the built-in default route', async () => {
+	const h = makeHarness({ routeOf: () => undefined });
+	setRuntimeRoute(undefined); // level 3 finds nothing in this deployment
+	try {
+		const result = await h.run('分析下当前项目');
+		assert.equal(result.kind, 'success');
+		assert.ok(result.text.includes('目录结构'));
+		assert.equal(h.calls.length, 1);
+		assert.equal(h.calls[0].provider, 'guomo');
+		assert.equal(h.calls[0].model, 'deepseek-v4.1-flash');
+		assert.ok(result.text.includes('内置默认'));
+	} finally {
+		resetRuntimeRoute();
+	}
+});
+
+test('flow: blank session picks up the runtime default route when present', async () => {
+	const h = makeHarness({ routeOf: () => undefined });
+	setRuntimeRoute({ provider: 'rt-p', model: 'rt-m' });
+	try {
+		const result = await h.run('分析下当前项目');
+		assert.equal(result.kind, 'success');
+		assert.equal(h.calls.length, 1);
+		assert.equal(h.calls[0].provider, 'rt-p');
+		assert.equal(h.calls[0].model, 'rt-m');
+		assert.ok(result.text.includes('运行时默认'));
+	} finally {
+		resetRuntimeRoute();
+	}
+});
+
+test('flow: a runtime-route change misses the cache (key carries the resolved route)', async () => {
+	const h = makeHarness({ routeOf: () => undefined });
+	setRuntimeRoute({ provider: 'rt-a', model: 'm' });
+	try {
+		await h.run('分析下当前项目');
+		setRuntimeRoute({ provider: 'rt-b', model: 'm' });
+		await h.run('分析下当前项目');
+		assert.equal(h.calls.length, 2);
+		assert.equal(h.calls[1].provider, 'rt-b');
+		// Back on the first route the cached entry is found again.
+		setRuntimeRoute({ provider: 'rt-a', model: 'm' });
+		const third = await h.run('分析下当前项目');
+		assert.equal(h.calls.length, 2);
+		assert.ok(third.text.includes('缓存命中'));
+	} finally {
+		resetRuntimeRoute();
+	}
+});
+
+test('flow: an explicit config pair pins the route even with a session route present', async () => {
+	const h = makeHarness({ config: { provider: 'pin-p', model: 'pin-m' } });
+	const result = await h.run('分析下当前项目');
+	assert.equal(result.kind, 'success');
+	assert.equal(h.calls[0].provider, 'pin-p');
+	assert.equal(h.calls[0].model, 'pin-m');
+	assert.ok(result.text.includes('配置指定'));
+});
+
+test('flow: an incomplete config pair fails with the untouched-draft error format', async () => {
+	const h = makeHarness({ config: { provider: 'pin-p' } });
+	const result = await h.run('分析下当前项目');
+	assert.equal(result.kind, 'error');
+	assert.match(result.text, /增强失败：prompt-enhancer: provider 与 model 必须成对配置/);
+	assert.match(result.text, /原始草稿未被修改，可直接发送。/);
+	assert.equal(h.calls.length, 0); // the model is never called for a config error
+});
+
+// ── prose output (no fixed section template) ───────────────────
+
+test('prompt: the system prompt mandates concise prose, never a fixed section template', async () => {
+	const h = makeHarness({});
+	const result = await h.run('分析下当前项目');
+	const system = h.calls[0].system;
+	// No mandatory section skeleton in any wording.
+	assert.ok(!system.includes('目标 / 需求 / 边界与约束 / 验收标准'));
+	assert.ok(!/Markdown sections/.test(system));
+	assert.ok(!/exactly these/.test(system));
+	// The conciseness mandate and the kept semantic rules.
+	assert.ok(system.includes('Keep it short'), 'brevity rule present');
+	assert.ok(system.includes('no Markdown headings'), 'no-headings rule present');
+	assert.ok(system.includes('at most three concrete paths'), 'path citation cap present');
+	assert.ok(system.includes('two to four sentences'), 'length guide present');
+	assert.ok(system.includes('默认：'), 'inline fallback marker kept');
+	assert.ok(system.includes('待确认'), 'no open-question rule kept');
+	// Removed verbosity drivers stay removed; the fallback rule is stated once.
+	assert.ok(!system.includes('as much grounding as possible'));
+	assert.ok(!system.includes('first what the task is'));
+	assert.ok(!system.includes('cite the real paths'), 'no mandatory path-listing instruction');
+	assert.equal(system.split('默认：…').length - 1, 1);
+	assert.equal(result.kind, 'success');
+	assert.ok(!result.text.includes('## '), 'enhanced output stays prose');
 });

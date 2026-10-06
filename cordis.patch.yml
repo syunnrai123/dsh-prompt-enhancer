@@ -4,8 +4,10 @@
     - id: prompt-enhancer
       name: dsh-plugin-prompt-enhancer
       config:
-        # provider + model must be set together; leave both unset to follow the
-        # current session's logged model route (recommended).
+        # provider + model must be set together; a set pair pins the route.
+        # Leave both unset to fall back through the session's logged model
+        # route, the DSH runtime/desktop default model, and the plugin's
+        # built-in default (recommended).
         # provider: ''
         # model: ''
         maxOutputTokens: 2000
