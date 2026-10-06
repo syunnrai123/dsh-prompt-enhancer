@@ -9,11 +9,11 @@ import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { Config, apply, __internals } from '../lib/index.js';
+import { Config, apply, inject, __internals } from '../lib/index.js';
 
 const {
 	createCache, withDeadline, digest, normalizeTimeout, gatherSignals,
-	resolveRoute, routeFromRuntimeDoc, readRuntimeRoute, runtimeRouteBases, setRuntimeRoute, resetRuntimeRoute, DEFAULT_ROUTE, classifyTransportError,
+	resolveRoute, readSessionModel, routeFromRuntimeDoc, readRuntimeRoute, runtimeRouteBases, setRuntimeRoute, resetRuntimeRoute, classifyTransportError,
 } = __internals;
 
 const sleep = (ms) => new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
@@ -60,6 +60,7 @@ function makeHarness({ routeOf, timeout = 5000, gen = okGen, surfaceDelay = 0, c
 		calls,
 		handlers,
 		surfaceCalls: () => surfaceCalls,
+		provide: (name, value) => { services[name] = value; },
 		setRoute: (route) => { currentRoute = route; },
 		run: (draft, signal) => handlers.enhance({ agent, rawInput: draft, signal }),
 	};
@@ -266,12 +267,13 @@ test('flow: the corrective retry spends the same end-to-end budget', async () =>
 const sessionAgent = (route) => ({ session: { id: 's1', requestHeader: () => ({ config: route }) } });
 const throwingAgent = { session: { requestHeader: () => { throw new Error('no header in a blank session'); } } };
 
-test('route: the built-in default is the DSH default model', () => {
-	assert.deepEqual(DEFAULT_ROUTE, { provider: 'guomo', model: 'deepseek-v4.1-flash' });
+test('route: agentDefaultModel is declared in inject (cordis wires only declared services)', () => {
+	assert.ok(inject.includes('agentDefaultModel'), 'the session-model level is dead without the inject declaration');
 });
 
 test('route: an explicit config pair pins the route over the session', async () => {
 	const route = await resolveRoute(
+		undefined,
 		Config({ provider: 'pin-p', model: 'pin-m' }),
 		sessionAgent({ provider: 's-p', model: 's-m' }),
 	);
@@ -280,6 +282,7 @@ test('route: an explicit config pair pins the route over the session', async () 
 
 test('route: an empty-string pair counts as unset and falls through to the session', async () => {
 	const route = await resolveRoute(
+		undefined,
 		Config({ provider: '', model: '' }),
 		sessionAgent({ provider: 's-p', model: 's-m' }),
 	);
@@ -288,18 +291,89 @@ test('route: an empty-string pair counts as unset and falls through to the sessi
 
 test('route: half a pair still throws the pairing error', async () => {
 	await assert.rejects(
-		() => resolveRoute(Config({ provider: 'pin-p' }), sessionAgent({ provider: 's-p', model: 's-m' })),
+		() => resolveRoute(undefined, Config({ provider: 'pin-p' }), sessionAgent({ provider: 's-p', model: 's-m' })),
 		/prompt-enhancer: provider 与 model 必须成对配置/,
 	);
 });
 
 test('route: the session route is followed when no pair is configured', async () => {
-	const route = await resolveRoute(Config({}), sessionAgent({ provider: 's-p', model: 's-m' }));
+	const route = await resolveRoute(undefined, Config({}), sessionAgent({ provider: 's-p', model: 's-m' }));
 	assert.deepEqual(route, { provider: 's-p', model: 's-m', source: 'session' });
+});
+
+const defaultModelCtx = (selection) => ({
+	get: (name) => (name === 'agentDefaultModel' ? { currentSelection: () => selection } : undefined),
+});
+
+test('route: a blank session takes the current session model (desktop default)', async () => {
+	const route = await resolveRoute(
+		defaultModelCtx({ provider: 'dm-p', model: 'dm-m' }),
+		Config({}),
+		sessionAgent(undefined),
+		{ runtime: { provider: 'rt-p', model: 'rt-m' } },
+	);
+	assert.deepEqual(route, { provider: 'dm-p', model: 'dm-m', source: 'sessionModel' });
+});
+
+test('route: a logged session route outranks the current session model', async () => {
+	const route = await resolveRoute(
+		defaultModelCtx({ provider: 'dm-p', model: 'dm-m' }),
+		Config({}),
+		sessionAgent({ provider: 's-p', model: 's-m' }),
+		{ runtime: { provider: 'rt-p', model: 'rt-m' } },
+	);
+	assert.deepEqual(route, { provider: 's-p', model: 's-m', source: 'session' });
+});
+
+test('route: an empty or failing current selection skips the level', async () => {
+	const empty = await resolveRoute(
+		defaultModelCtx(undefined),
+		Config({}),
+		sessionAgent(undefined),
+		{ runtime: { provider: 'rt-p', model: 'rt-m' } },
+	);
+	assert.deepEqual(empty, { provider: 'rt-p', model: 'rt-m', source: 'runtime' });
+	await assert.rejects(
+		() => resolveRoute(
+			{ get: () => { throw new Error('service unavailable'); } },
+			Config({}),
+			sessionAgent(undefined),
+			{ runtime: undefined },
+		),
+		/prompt-enhancer: 当前会话还没有已记录的模型路由/,
+	);
+});
+
+test('route: the priority ladder pins 配置指定 > 当前会话 > 运行时', async () => {
+	const runtimeStub = { runtime: { provider: 'rt-p', model: 'rt-m' } };
+	const sessionCtx = defaultModelCtx({ provider: 'dm-p', model: 'dm-m' });
+	const logged = sessionAgent({ provider: 's-p', model: 's-m' });
+	const fresh = sessionAgent(undefined);
+	// 配置指定 outranks every other source.
+	assert.deepEqual(
+		await resolveRoute(sessionCtx, Config({ provider: 'pin-p', model: 'pin-m' }), logged, runtimeStub),
+		{ provider: 'pin-p', model: 'pin-m', source: 'config' },
+	);
+	// 当前会话: the logged route outranks the session's current model.
+	assert.deepEqual(
+		await resolveRoute(sessionCtx, Config({}), logged, runtimeStub),
+		{ provider: 's-p', model: 's-m', source: 'session' },
+	);
+	// 当前会话: a fresh session's current model outranks the runtime level.
+	assert.deepEqual(
+		await resolveRoute(sessionCtx, Config({}), fresh, runtimeStub),
+		{ provider: 'dm-p', model: 'dm-m', source: 'sessionModel' },
+	);
+	// 运行时 is the last level that resolves.
+	assert.deepEqual(
+		await resolveRoute(defaultModelCtx(undefined), Config({}), fresh, runtimeStub),
+		{ provider: 'rt-p', model: 'rt-m', source: 'runtime' },
+	);
 });
 
 test('route: a blank session (no logged route) picks up the runtime level', async () => {
 	const route = await resolveRoute(
+		undefined,
 		Config({}),
 		sessionAgent(undefined),
 		{ runtime: { provider: 'rt-p', model: 'rt-m' } },
@@ -309,6 +383,7 @@ test('route: a blank session (no logged route) picks up the runtime level', asyn
 
 test('route: a session route outranks the runtime level', async () => {
 	const route = await resolveRoute(
+		undefined,
 		Config({}),
 		sessionAgent({ provider: 's-p', model: 's-m' }),
 		{ runtime: { provider: 'rt-p', model: 'rt-m' } },
@@ -316,28 +391,35 @@ test('route: a session route outranks the runtime level', async () => {
 	assert.deepEqual(route, { provider: 's-p', model: 's-m', source: 'session' });
 });
 
-test('route: a runtime entry missing its model half is skipped', async () => {
-	const route = await resolveRoute(
-		Config({}),
-		sessionAgent(undefined),
-		{ runtime: { provider: 'rt-p' } },
+test('route: a runtime entry missing its model half is skipped, and all levels missing throws', async () => {
+	await assert.rejects(
+		() => resolveRoute(
+			undefined,
+			Config({}),
+			sessionAgent(undefined),
+			{ runtime: { provider: 'rt-p' } },
+		),
+		/prompt-enhancer: 当前会话还没有已记录的模型路由/,
 	);
-	assert.deepEqual(route, { provider: 'guomo', model: 'deepseek-v4.1-flash', source: 'builtin' });
 });
 
-test('route: a blank session with no runtime entry lands on the built-in default', async () => {
-	const route = await resolveRoute(Config({}), sessionAgent(undefined), { runtime: undefined });
-	assert.deepEqual(route, { provider: 'guomo', model: 'deepseek-v4.1-flash', source: 'builtin' });
+test('route: a blank session with no runtime entry reports the actionable route error', async () => {
+	await assert.rejects(
+		() => resolveRoute(undefined, Config({}), sessionAgent(undefined), { runtime: undefined }),
+		/prompt-enhancer: 当前会话还没有已记录的模型路由——请先发送一条消息，或在插件配置中显式指定 provider \+ model/,
+	);
 });
 
 test('route: a throwing requestHeader counts as no session route', async () => {
-	const route = await resolveRoute(Config({}), throwingAgent, { runtime: undefined });
-	assert.deepEqual(route, { provider: 'guomo', model: 'deepseek-v4.1-flash', source: 'builtin' });
+	await assert.rejects(
+		() => resolveRoute(undefined, Config({}), throwingAgent, { runtime: undefined }),
+		/prompt-enhancer: 当前会话还没有已记录的模型路由/,
+	);
 });
 
-test('route: all four levels failing throws the original untouched-draft error', async () => {
+test('route: every level missing throws the original untouched-draft error', async () => {
 	await assert.rejects(
-		() => resolveRoute(Config({}), sessionAgent(undefined), { runtime: undefined, builtin: undefined }),
+		() => resolveRoute(undefined, Config({}), sessionAgent(undefined), { runtime: undefined }),
 		/prompt-enhancer: 当前会话还没有已记录的模型路由——请先发送一条消息，或在插件配置中显式指定 provider \+ model/,
 	);
 });
@@ -442,17 +524,40 @@ test('runtime route: the base walk-up covers ancestors plus cwd', async () => {
 
 // ── end-to-end: blank-session flows through the real apply() ───
 
-test('flow: blank session without config enhances via the built-in default route', async () => {
+test('flow: blank session follows the current session model, ahead of runtime fallbacks', async () => {
 	const h = makeHarness({ routeOf: () => undefined });
-	setRuntimeRoute(undefined); // level 3 finds nothing in this deployment
+	h.provide('agentDefaultModel', { currentSelection: () => ({ provider: 'dm-p', model: 'dm-m' }) });
+	setRuntimeRoute({ provider: 'rt-p', model: 'rt-m' });
 	try {
 		const result = await h.run('分析下当前项目');
 		assert.equal(result.kind, 'success');
-		assert.ok(result.text.includes('目录结构'));
-		assert.equal(h.calls.length, 1);
-		assert.equal(h.calls[0].provider, 'guomo');
-		assert.equal(h.calls[0].model, 'deepseek-v4.1-flash');
-		assert.ok(result.text.includes('内置默认'));
+		assert.equal(h.calls[0].provider, 'dm-p');
+		assert.equal(h.calls[0].model, 'dm-m');
+		assert.ok(result.text.includes('会话模型'));
+	} finally {
+		resetRuntimeRoute();
+	}
+});
+
+test('flow: a session with logged routes keeps following them (existing-session case)', async () => {
+	const h = makeHarness({});
+	h.provide('agentDefaultModel', { currentSelection: () => ({ provider: 'dm-p', model: 'dm-m' }) });
+	const result = await h.run('分析下当前项目');
+	assert.equal(result.kind, 'success');
+	assert.equal(h.calls[0].provider, 'p');
+	assert.equal(h.calls[0].model, 'm');
+	assert.ok(result.text.includes('跟随会话'));
+});
+
+test('flow: blank session without any route source fails with the untouched-draft error', async () => {
+	const h = makeHarness({ routeOf: () => undefined });
+	setRuntimeRoute(undefined); // no runtime manifest route in this deployment
+	try {
+		const result = await h.run('分析下当前项目');
+		assert.equal(result.kind, 'error');
+		assert.match(result.text, /增强失败：prompt-enhancer: 当前会话还没有已记录的模型路由——请先发送一条消息，或在插件配置中显式指定 provider \+ model/);
+		assert.match(result.text, /原始草稿未被修改，可直接发送。/);
+		assert.equal(h.calls.length, 0); // the model is never called without a route
 	} finally {
 		resetRuntimeRoute();
 	}
