@@ -12,8 +12,8 @@
         # model: ''
         maxOutputTokens: 2000
         # End-to-end deadline (ms); corrective retries share this one budget.
-        # Invalid values fall back to 30000. Legacy alias: timeoutMs.
-        timeout: 30000
+        # Invalid values fall back to 45000. Legacy alias: timeoutMs.
+        timeout: 45000
         # Reasoning tokens share maxOutputTokens; 'off' keeps the whole budget
         # for the rewrite (a truncation still retries once with a doubled cap).
         reasoningEffort: off

@@ -13,7 +13,7 @@ import { Config, apply, __internals } from '../lib/index.js';
 
 const {
 	createCache, withDeadline, digest, normalizeTimeout, gatherSignals,
-	resolveRoute, routeFromRuntimeDoc, readRuntimeRoute, runtimeRouteBases, setRuntimeRoute, resetRuntimeRoute, DEFAULT_ROUTE,
+	resolveRoute, routeFromRuntimeDoc, readRuntimeRoute, runtimeRouteBases, setRuntimeRoute, resetRuntimeRoute, DEFAULT_ROUTE, classifyTransportError,
 } = __internals;
 
 const sleep = (ms) => new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
@@ -61,7 +61,7 @@ function makeHarness({ routeOf, timeout = 5000, gen = okGen, surfaceDelay = 0, c
 		handlers,
 		surfaceCalls: () => surfaceCalls,
 		setRoute: (route) => { currentRoute = route; },
-		run: (draft) => handlers.enhance({ agent, rawInput: draft }),
+		run: (draft, signal) => handlers.enhance({ agent, rawInput: draft, signal }),
 	};
 }
 
@@ -125,8 +125,8 @@ test('digest: stable, distinguishing, length-tagged', () => {
 
 // ── timeout configuration (normalizeTimeout) ───────────────────
 
-test('timeout: defaults to 30000ms when unset', () => {
-	assert.equal(normalizeTimeout(Config({})), 30_000);
+test('timeout: defaults to 45000ms when unset', () => {
+	assert.equal(normalizeTimeout(Config({})), 45_000);
 });
 
 test('timeout: a custom value is honored', () => {
@@ -135,11 +135,11 @@ test('timeout: a custom value is honored', () => {
 	assert.equal(normalizeTimeout(Config({ timeout: '2500' })), 2500); // numeric strings accepted
 });
 
-test('timeout: invalid values fall back to 30000ms without throwing', () => {
-	assert.equal(normalizeTimeout(Config({ timeout: -5 })), 30_000);
-	assert.equal(normalizeTimeout(Config({ timeout: 0 })), 30_000);
-	assert.equal(normalizeTimeout(Config({ timeout: 'abc' })), 30_000);
-	assert.equal(normalizeTimeout(Config({ timeout: null })), 30_000);
+test('timeout: invalid values fall back to 45000ms without throwing', () => {
+	assert.equal(normalizeTimeout(Config({ timeout: -5 })), 45_000);
+	assert.equal(normalizeTimeout(Config({ timeout: 0 })), 45_000);
+	assert.equal(normalizeTimeout(Config({ timeout: 'abc' })), 45_000);
+	assert.equal(normalizeTimeout(Config({ timeout: null })), 45_000);
 });
 
 test('timeout: legacy timeoutMs alias still honored', () => {
@@ -508,6 +508,102 @@ test('flow: an incomplete config pair fails with the untouched-draft error forma
 	assert.match(result.text, /增强失败：prompt-enhancer: provider 与 model 必须成对配置/);
 	assert.match(result.text, /原始草稿未被修改，可直接发送。/);
 	assert.equal(h.calls.length, 0); // the model is never called for a config error
+});
+
+// ── failure classification: timeout vs cancel vs upstream drop ─
+
+test('flow: a mid-stream transport drop during the deadline surfaces the timeout, not "terminated"', async () => {
+	const h = makeHarness({
+		timeout: 60,
+		gen: async function* dropsMidStream() {
+			await sleep(150); // the deadline fires first; the stream then dies bare
+			throw new TypeError('terminated');
+		},
+	});
+	const first = await h.run('超时途中连接被掐断');
+	assert.equal(first.kind, 'error');
+	assert.match(first.text, /增强超时（60ms）/);
+	assert.match(first.text, /原始草稿未被修改，可直接发送。/);
+	assert.ok(!first.text.includes('terminated'), 'bare transport error must not leak');
+});
+
+test('flow: an upstream transport drop auto-retries once, then settles classified', async () => {
+	const h = makeHarness({
+		timeout: 5000,
+		gen: async function* dropsImmediately() {
+			yield { type: 'text-delta', text: '部分输出' };
+			throw new TypeError('terminated');
+		},
+	});
+	const first = await h.run('上游掐断测试');
+	assert.equal(first.kind, 'error');
+	assert.match(first.text, /上游连接中断（terminated）/);
+	assert.match(first.text, /已自动重试仍失败/);
+	assert.match(first.text, /原始草稿未被修改，可直接发送。/);
+	assert.ok(!first.text.includes('增强超时'));
+	assert.equal(h.calls.length, 2); // one automatic retry within the same budget
+	const second = await h.run('上游掐断测试');
+	assert.equal(h.calls.length, 4); // failures are never cached, so a retry run regenerates
+});
+
+test('flow: a single upstream drop recovers through the automatic retry', async () => {
+	let attempts = 0;
+	const h = makeHarness({
+		timeout: 5000,
+		gen: function* dropsOnce() {
+			attempts += 1;
+			if (attempts === 1) throw new TypeError('terminated');
+			yield { type: 'text-delta', text: '恢复后的完整结果' };
+			yield { type: 'finish', reason: { kind: 'stop' } };
+		},
+	});
+	const result = await h.run('断流恢复测试');
+	assert.equal(result.kind, 'success');
+	assert.ok(result.text.includes('恢复后的完整结果'));
+	assert.ok(result.text.includes('连接中断后自动重试'));
+	assert.equal(h.calls.length, 2);
+});
+
+test('flow: a host-side abort (pi-ai) belongs to the cancel family, not 增强失败', async () => {
+	const h = makeHarness({
+		timeout: 5000,
+		gen: async function* hostAborts() {
+			throw new Error('pi-ai request aborted by caller');
+		},
+	});
+	const result = await h.run('宿主中止测试');
+	assert.equal(result.kind, 'error');
+	assert.match(result.text, /被宿主中止/);
+	assert.match(result.text, /原始草稿未被修改，可直接发送。/);
+	assert.ok(!result.text.includes('增强失败：'));
+});
+
+test('flow: a caller cancel is distinguished from a timeout and keeps the draft safe', async () => {
+	const h = makeHarness({ timeout: 5000 });
+	const cancelled = new AbortController();
+	cancelled.abort(); // no reason → the plain cancel note
+	const plain = await h.run('取消测试', cancelled.signal);
+	assert.equal(plain.kind, 'error');
+	assert.match(plain.text, /已取消/);
+	assert.ok(!plain.text.includes('增强超时'));
+	assert.match(plain.text, /原始草稿未被修改，可直接发送。/);
+
+	const withReason = new AbortController();
+	const pending = h.run('取消测试二', withReason.signal);
+	withReason.abort(new Error('user stopped'));
+	const result = await pending;
+	assert.equal(result.kind, 'error');
+	assert.match(result.text, /user stopped/);
+	assert.match(result.text, /原始草稿未被修改，可直接发送。/);
+});
+
+test('transport: bare "terminated" is classified as an upstream drop, other errors pass through', () => {
+	const wrapped = classifyTransportError(new TypeError('terminated'));
+	assert.equal(wrapped?.code, 'PROMPT_ENHANCE_UPSTREAM_DROPPED');
+	assert.match(wrapped?.message, /上游连接中断/);
+	assert.equal(wrapped?.detail, 'terminated');
+	assert.equal(classifyTransportError(new Error('boom')), undefined);
+	assert.equal(classifyTransportError(undefined), undefined);
 });
 
 // ── prose output (no fixed section template) ───────────────────

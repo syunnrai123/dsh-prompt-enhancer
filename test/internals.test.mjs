@@ -110,6 +110,8 @@ eq('retry: at ceiling settles', nextAttempt({ code: 'ENHANCE_TRUNCATED' }, { max
 eq('retry: unsupported effort drops field', nextAttempt({ code: 'ENHANCE_EFFORT_UNSUPPORTED' }, { maxTokens: 2000, effortDropped: false }), { maxTokens: 2000, effortDropped: true });
 eq('retry: effort dropped only once', nextAttempt({ code: 'ENHANCE_EFFORT_UNSUPPORTED' }, { maxTokens: 2000, effortDropped: true }), undefined);
 eq('retry: unrelated failure settles', nextAttempt({ code: 'OTHER' }, { maxTokens: 2000, effortDropped: false }), undefined);
+eq('retry: upstream drop retries once', nextAttempt({ code: 'PROMPT_ENHANCE_UPSTREAM_DROPPED' }, { maxTokens: 2000, effortDropped: false, droppedRetried: false }), { maxTokens: 2000, effortDropped: false, droppedRetried: true });
+eq('retry: upstream drop settles after the retry', nextAttempt({ code: 'PROMPT_ENHANCE_UPSTREAM_DROPPED' }, { maxTokens: 2000, effortDropped: false, droppedRetried: true }), undefined);
 
 // ── effort-field rejection via the finish channel (zai/glm report, not throw) ──
 const effortMessage = 'provider "zai-coding-cn" model "glm-5.3" does not support reasoning effort "off"';

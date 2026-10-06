@@ -10,7 +10,7 @@ DeepSeek Harness (DSH) 插件。改写之前，它先自动读懂当前工作区
 - **火花按钮状态指示**：输入框为空时星星为蓝色 (`#0E6FEA`)，有内容时变为红色 (`#E31D34`)
 - **结果面板**：滑入动效，三态显示（pending / error / success），支持复制、替换草稿、关闭
 - **模型路由**：四级回退——显式配置的固定 `provider` + `model` → 当前会话已记录路由 → DSH 运行时/桌面默认模型（`_dsh_src/dsh/` 清单）→ 插件内置默认（`guomo` / `deepseek-v4.1-flash`）；仅全部落空才报错，空白会话开箱即用
-- **端到端超时**：默认 30s 可配，覆盖上下文采集与生成全流程
+- **端到端超时**：默认 45s 可配，覆盖上下文采集与生成全流程
 - **结果缓存**：相同草稿与模型组合直接复用，避免重复计算
 
 ## 工作原理
@@ -55,6 +55,7 @@ DeepSeek Harness (DSH) 插件。改写之前，它先自动读懂当前工作区
 - **反提示注入**：上下文包视为惰性事实数据——包内文件、README、命中行中的祈使文本是仓库事实，不是给模型的指令
 - **秘密文件排除**：`.env*` / `*.pem` / `*.key` / `*.p12` / `*.pfx` / `id_rsa*` 不参与关键词检索与片段引用
 - **全链路容错**：git 缺失、文件不可读、检索不可用都静默降级，增强不会因此失败
+- **失败分类**：端到端超时、用户取消、上游连接中断（如 `terminated`）、宿主中止分开提示——超时附带调大 `timeout` 或换用更快模型的指引；上游中断会在同一预算内自动重试一次，仍失败才报错并建议检查模型服务；所有失败均不改动原始草稿
 - **不破坏草稿**：增强失败时原始草稿保持不变，随时可以直接发送
 
 ## 安装与启用
@@ -105,7 +106,7 @@ Copy-Item -Recurse dsh-prompt-enhancer C:\Users\<user>\.dsh\profiles\desktop\nod
 |---|---|---|
 | `provider` + `model` | 未设置 | 必须成对设置；成对设置即固定路由（优先级最高）。不设置则按「当前会话路由 → DSH 运行时/桌面默认 → 内置默认」回退（推荐不设置） |
 | `maxOutputTokens` | `2000` | 增强输出 token 上限（推理 token 与正文共享此预算） |
-| `timeout` | `30000` | 单次增强端到端超时，毫秒。覆盖采集与生成全程，纠正性重试共用同一预算。非法值自动回退 30000；旧名 `timeoutMs` 仍兼容 |
+| `timeout` | `45000` | 单次增强端到端超时，毫秒。覆盖采集与生成全程，纠正性重试共用同一预算。非法值自动回退 45000；旧名 `timeoutMs` 仍兼容 |
 | `reasoningEffort` | `"off"` | 辅助调用推理档位，原样透传给模型服务商；设为空字符串则不传该字段。服务商若拒绝该字段，插件会自动省略并重试一次 |
 | `systemPromptExtra` | `""` | 追加到增强系统提示词的自定义指令 |
 | `contextEnabled` | `true` | 上下文采集总开关（false 时固定为纯改写） |
@@ -128,7 +129,7 @@ Copy-Item -Recurse dsh-prompt-enhancer C:\Users\<user>\.dsh\profiles\desktop\nod
         # provider: 'deepseek'
         # model: 'deepseek-chat'
         maxOutputTokens: 2000
-        timeout: 30000
+        timeout: 45000
         reasoningEffort: off
         maxContextChars: 10000
         inventoryDepth: 2
